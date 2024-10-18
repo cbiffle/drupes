@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{collections::{BTreeMap, HashMap}, fs::File, io::{BufReader, ErrorKind, Read, Seek}, path::{Path, PathBuf}};
+use std::{collections::{BTreeMap, HashMap}, fs::File, io::{self, BufReader, Read, Seek}, path::{Path, PathBuf}};
 
 use anyhow::bail;
 use clap::Parser;
@@ -75,7 +75,7 @@ fn main() -> anyhow::Result<()> {
             if meta.is_file() && (meta.len() > 0 || args.empty) {
                 paths.entry(meta.len())
                     .or_default()
-                    .push(entry.path().to_owned());
+                    .push(entry.path());
             }
         }
     }
@@ -101,31 +101,23 @@ fn main() -> anyhow::Result<()> {
     // clear this way once I got used to it and (2) it's by far the
     // easiest-to-reach "go faster button."
     let hashed_files: HashMap<blake3::Hash, Vec<&Path>> = paths.par_iter()
-        // Flatten the map into a list of paths to hash, discarding the size
-        // information.
-        .flat_map(|(_size, paths)| paths)
+        // Flatten the map into an iterator of paths to hash with filesize
+        .flat_map(|(size, paths)| paths.par_iter().map(|x| (x.as_path(), *size)))
         // Hash each path, producing a (path, hash) pair. Note that this can
         // fail to access the filesystem.
         //
         // We use `map_with` here to allocate exactly one I/O buffer per backing
         // Rayon thread, instead of one per closure, because I'm neurotic.
-        .map_with(vec![0u8; PREHASH_SIZE], |buf, path| {
+        .map_with(vec![0u8; PREHASH_SIZE], |buf, (path, size)| {
             let mut f = File::open(path)?;
 
-            // Read up to `PREHASH_SIZE` bytes, or fewer if the file is shorter
-            // than that. (It's odd that there's no operation for this in the
-            // standard library.)
-            let mut total = 0;
-            while total < buf.len() {
-                match f.read(&mut buf[total..]) {
-                    Ok(0) => break,
-                    Ok(n) => total += n,
-                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
-                }
-            }
+            // If the file is shorter than `PREHASH_SIZE` truncate the buffer
+            // to ignore the unwritten bytes in the hash.
+            let buf = &mut buf[..PREHASH_SIZE.min(size as usize)];
+            f.read_exact(buf)?;
+
             // Hash the first chunk of the file.
-            Ok((blake3::hash(buf), path))
+            Ok::<_, io::Error>((blake3::hash(buf), path))
         })
         // Squawk about any reads that failed, and remove them from further
         // consideration.

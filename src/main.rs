@@ -2,13 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{collections::{BTreeMap, HashMap}, fs::File, io::{BufReader, ErrorKind, Read, Seek}, path::{Path, PathBuf}};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs::File,
+    io::{BufReader, ErrorKind, Read, Seek},
+    path::{Path, PathBuf},
+};
 
 use anyhow::bail;
 use clap::Parser;
+use jwalk::WalkDir;
+use nix::sys::stat::lstat;
 use rayon::prelude::*;
 use size::Size;
-use jwalk::WalkDir;
 
 const PREHASH_SIZE: usize = 4 * 1024;
 
@@ -24,6 +30,10 @@ struct Drupes {
     /// printed filenames are files to consider removing.
     #[clap(short('f'), long)]
     omit_first: bool,
+
+    /// Skip duplicates that are hard links.
+    #[clap(short, long)]
+    skip_hard_links: bool,
 
     /// Instead of listing duplicates, print a summary of what was found.
     #[clap(short('m'), long)]
@@ -72,12 +82,34 @@ fn main() -> anyhow::Result<()> {
         for entry in WalkDir::new(root) {
             let entry = entry?;
             let meta = entry.metadata()?;
-            if meta.is_file() && (meta.len() > 0 || args.empty) {
-                paths.entry(meta.len())
+            let length = meta.len();
+            if meta.is_file() && (length > 0 || args.empty) {
+                paths
+                    .entry(length)
                     .or_default()
                     .push(entry.path().to_owned());
             }
         }
+    }
+
+    if args.skip_hard_links {
+        // For each file size group, get the inode number of each pathname. Take
+        // only the 1st of each inode number group.
+        let mut culled: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
+        for (size, group) in &paths {
+            let mut inodes_seen: Vec<u64> = Vec::new();
+            for p in group {
+                if let Ok(status) = lstat(p) {
+                    if !inodes_seen.contains(&status.st_ino) {
+                        culled.entry(*size).or_default().push(p.to_path_buf());
+                        inodes_seen.push(status.st_ino);
+                    }
+                } else {
+                    culled.entry(*size).or_default().push(p.to_path_buf());
+                }
+            }
+        }
+        paths = culled;
     }
 
     // Drop all file size groups that contain no duplicates (have only one
@@ -100,7 +132,8 @@ fn main() -> anyhow::Result<()> {
     // This is constructed as a Rayon pipeline because (1) I find it reasonably
     // clear this way once I got used to it and (2) it's by far the
     // easiest-to-reach "go faster button."
-    let hashed_files: HashMap<blake3::Hash, Vec<&Path>> = paths.par_iter()
+    let hashed_files: HashMap<blake3::Hash, Vec<&Path>> = paths
+        .par_iter()
         // Flatten the map into a list of paths to hash, discarding the size
         // information.
         .flat_map(|(_size, paths)| paths)
@@ -129,13 +162,11 @@ fn main() -> anyhow::Result<()> {
         })
         // Squawk about any reads that failed, and remove them from further
         // consideration.
-        .filter_map(|result| {
-            match result {
-                Ok(data) => Some(data),
-                Err(e) => {
-                    eprintln!("{e}");
-                    None
-                }
+        .filter_map(|result| match result {
+            Ok(data) => Some(data),
+            Err(e) => {
+                eprintln!("{e}");
+                None
             }
         })
         // Take the stream of (hash, path) pairs and collate them by hash,
@@ -148,10 +179,13 @@ fn main() -> anyhow::Result<()> {
         // Many hash-groups will only contain one path, and will be filtered out
         // below. Any group containing multiple paths needs to be hashed more
         // fully in the next pass.
-        .fold(HashMap::<blake3::Hash, Vec<&Path>>::new, |mut map, (hash, path)| {
-            map.entry(hash).or_default().push(path);
-            map
-        })
+        .fold(
+            HashMap::<blake3::Hash, Vec<&Path>>::new,
+            |mut map, (hash, path)| {
+                map.entry(hash).or_default().push(path);
+                map
+            },
+        )
         // Collapse the stream of hashmaps into one, merging hash groups as
         // required.
         .reduce(HashMap::new, |mut a, b| {
@@ -167,7 +201,8 @@ fn main() -> anyhow::Result<()> {
     //
     // For any files whose first `PREHASH_SIZE` bytes match at least one other
     // file, hash the entire contents to scan for differences later on.
-    let mut hashed_files = hashed_files.into_par_iter()
+    let mut hashed_files = hashed_files
+        .into_par_iter()
         // Ignore groups with only one member.
         .filter(|(_, paths)| paths.len() > 1)
         // Flatten the `prehash => vec of paths` map to a stream of `prehash,
@@ -203,13 +238,11 @@ fn main() -> anyhow::Result<()> {
         })
         // Squawk about any reads that failed, and remove them from further
         // consideration.
-        .filter_map(|result| {
-            match result {
-                Ok(data) => Some(data),
-                Err(e) => {
-                    eprintln!("{e}");
-                    None
-                }
+        .filter_map(|result| match result {
+            Ok(data) => Some(data),
+            Err(e) => {
+                eprintln!("{e}");
+                None
             }
         })
         // Collect groups of (path, hash) pairs and collate them by hash. This
@@ -243,7 +276,8 @@ fn main() -> anyhow::Result<()> {
         // BLAKE3 hash, and different contents would be a newsworthy event. It's
         // certainly possible, but rather unlikely.
         eprintln!("paranoid mode: verifying file contents");
-        hashed_files.par_iter()
+        hashed_files
+            .par_iter()
             .filter(|(_, files)| files.len() > 1)
             .try_for_each(|(_, files)| {
                 // Arbitrarily choose the first file in each group as a
@@ -267,9 +301,11 @@ fn main() -> anyhow::Result<()> {
                     // general, this program is not written with that situation
                     // in mind.
                     if first_meta.len() != other_meta.len() {
-                        bail!("files no longer have same length:\n{}\n{}",
+                        bail!(
+                            "files no longer have same length:\n{}\n{}",
                             first.display(),
-                            other.display());
+                            other.display()
+                        );
                     }
 
                     // Read one byte at a time from each file, comparing each
@@ -283,9 +319,11 @@ fn main() -> anyhow::Result<()> {
                         first_f.read_exact(&mut buf1)?;
                         other_f.read_exact(&mut buf2)?;
                         if buf1 != buf2 {
-                            bail!("files differ (blake3 collision found?):\n{}\n{}",
+                            bail!(
+                                "files differ (blake3 collision found?):\n{}\n{}",
                                 first.display(),
-                                other.display());
+                                other.display()
+                            );
                         }
                     }
                 }
@@ -303,27 +341,33 @@ fn main() -> anyhow::Result<()> {
         let total_files_checked = paths.values().map(|v| v.len()).sum::<usize>();
 
         // How many hash-groups containing duplicates did we discover?
-        let set_count = hashed_files.values()
+        let set_count = hashed_files
+            .values()
             .filter(|files| files.len() > 1)
             .count();
         // And how many duplicates, beyond the first in each group, did we find?
-        let dupe_count = hashed_files.values()
+        let dupe_count = hashed_files
+            .values()
             .filter_map(|files| files.len().checked_sub(1))
             .sum::<usize>();
         // How large are the duplicates on disk?
-        let dupe_size = hashed_files.values()
+        let dupe_size = hashed_files
+            .values()
             .filter(|files| files.len() > 1)
             .try_fold(0, |sum, files| {
-                std::fs::metadata(files[0])
-                    .map(|meta| sum + meta.len() * (files.len() as u64 - 1))
+                std::fs::metadata(files[0]).map(|meta| sum + meta.len() * (files.len() as u64 - 1))
             })?;
         // Convenient unit formatting:
         let dupe_size = Size::from_bytes(dupe_size);
 
-        println!("{dupe_count} duplicate files (in {set_count} sets), \
-            occupying {dupe_size}");
-        println!("checked {total_files_checked} files in \
-            {unique_size_classes} size classes");
+        println!(
+            "{dupe_count} duplicate files (in {set_count} sets), \
+            occupying {dupe_size}"
+        );
+        println!(
+            "checked {total_files_checked} files in \
+            {unique_size_classes} size classes"
+        );
         println!("prehashing identified {unique_prehash_groups} groups");
     } else {
         // Print filenames of each duplicate-group.
@@ -361,7 +405,6 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-
     }
 
     Ok(())

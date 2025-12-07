@@ -113,7 +113,7 @@ this case the gap widens to 2.5-22x (larger files make the gap larger):
 | rmlint | 2.206 s | 0.865 s |
 | **drupes** | 0.716 s | 0.098 s |
 
-### Okay but why
+### Okay but why it fast
 
 Rust is not inherently faster than C, _but it does make it easier to use
 advanced performance techniques than C does._
@@ -132,3 +132,18 @@ advanced performance techniques than C does._
 5. `drupes` trusts BLAKE3 to be collision-resistant, so it doesn't need to do
    byte-for-byte comparisons of files it's already hashed. (Though you can
    request one using `--paranoid` if you're feeling, well, paranoid.)
+
+### Performance caveats
+
+`drupes` is really intended for use on random-access media. The less your
+storage matches that description, the worse your experience will be. My workflow
+when processing old mystery disks is to copy or image the disks onto faster
+media, deduplicate, and process.
+
+In particular, `drupes` does not perform well on CDs, DVDs, floppies, or tape.
+Such media are currently best handled by copying them onto a faster device,
+ideally an SSD, but a reasonably modern hard disk will also do.
+
+This aspect could potentially be improved, but so far the added complexity
+hasn't seemed worth it, in particular because there's no good portable way of
+assessing physical file layout in a filesystem. (Suggestions would be welcome.)
